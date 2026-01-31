@@ -1,5 +1,7 @@
 package me.flame.turboscanner;
 
+import org.jetbrains.annotations.Contract;
+
 /**
  * ScanResult stores the output of a single stage-1 byte scan over a JSON byte stream.
  *
@@ -59,13 +61,26 @@ public final class ScanResult {
 
     boolean utf8Error;
 
-    public ScanResult(int lanes) {
+    private ScanResult(int lanes) {
         this.lanes = lanes;
         this.quoteMask = new long[lanes];
         this.backslashMask = new long[lanes];
         this.controlMask = new long[lanes];
         this.structuralMask = new long[lanes];
         this.insideStringMask = new long[lanes];
+    }
+
+    public static ScanResult create(int byteLength) {
+        return new ScanResult(lanesFor(byteLength));
+    }
+
+    public static ScanResult createWithLanes(int lanes) {
+        return new ScanResult(lanes);
+    }
+
+    @Contract(pure = true)
+    public static int lanesFor(int byteLength) {
+        return (byteLength + 63) >>> 6;
     }
 
     public void clear() {
