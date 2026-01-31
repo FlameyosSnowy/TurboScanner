@@ -3,209 +3,160 @@ package me.flame.turboscanner;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
-import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 
 /**
- * Vectorized stage-1 JSON byte scanner.
+ * High-performance stage-1 JSON byte scanner using SIMD.
  *
- * <p>This scanner performs a single forward pass over a byte array and
- * classifies bytes into semantic categories needed for JSON parsing.
- *
- * <h2>Stage-1 responsibilities</h2>
+ * <p>This scanner:
  * <ul>
- *   <li>Detect quotes and backslashes</li>
- *   <li>Compute inside-string state (with escape handling)</li>
- *   <li>Identify structural characters outside strings</li>
- * </ul>
- *
- * <p>No UTF-8 decoding or parsing is performed here.
- * This stage is designed to be combined with:
- * <ul>
- *   <li>a UTF-8 validator (optional)</li>
- *   <li>a structural index builder (stage-2)</li>
+ *   <li>Classifies quotes, backslashes, control chars, and structural chars</li>
+ *   <li>Computes inside-string mask with branchless prefix XOR</li>
+ *   <li>Uses cache-line aligned chunking to reduce memory latency</li>
+ *   <li>Falls back to scalar processing for remaining bytes</li>
  * </ul>
  */
-@SuppressWarnings("unused")
 public final class VectorByteScanner implements ByteScanner {
-    private static final VectorSpecies<Byte> SPECIES =
-        ByteVector.SPECIES_PREFERRED;
 
-    /** ASCII control characters are &lt; 0x20 */
+    private static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
+    private static final int VLEN = SPECIES.length();
+    private static final int CHUNK_SIZE = 512; // process 8 cache lines at a time
     private static final byte CONTROL_THRESHOLD = 0x20;
+    private static final byte QUOTE = (byte) '"';
+    private static final byte BACKSLASH = (byte) '\\';
 
     @Override
     public int scan(byte[] input, int offset, int length, @NotNull ScanResult out) {
-        int i = 0;
-        int lanes = SPECIES.length();
+        if (length == 0) return 0;
 
         long prevInString = out.prevInString;
-        long prevEndsWithBackslash = out.prevEndsWithBackslash;
+        long prevBackslashOdd = out.prevEndsWithBackslash;
+        int i = 0;
 
-        for (; i + lanes <= length; i += lanes) {
-            ByteVector vector = loadVector(input, offset + i);
+        final int simdLimit = length - (length % VLEN);
 
-            long quoteBits      = detectQuotes(vector);
-            long backslashBits  = detectBackslashes(vector);
-            long controlBits    = detectControlCharacters(vector);
-            long structuralBits = detectStructuralCharacters(vector);
+        // Process input in chunks to improve cache locality
+        while (i < simdLimit) {
+            int chunkLen = Math.min(simdLimit - i, CHUNK_SIZE);
+            int chunkEnd = i + chunkLen;
 
-            long escapedBits =
-                computeEscapedBytes(backslashBits, prevEndsWithBackslash);
+            for (int pos = i; pos < chunkEnd; pos += VLEN) {
+                ByteVector vec = ByteVector.fromArray(SPECIES, input, offset + pos);
 
-            long inStringMask =
-                computeInsideStringMask(quoteBits, escapedBits, prevInString);
+                // Extract masks for quote, backslash, control, structural chars
+                long quoteMask = detectQuotes(vec);
+                long backslashMask = detectBackslashes(vec);
+                long controlMask = detectControlChars(vec);
+                long structuralMask = detectStructuralChars(vec);
 
-            prevInString =
-                extractStringCarry(inStringMask);
+                // Compute escaped quotes (branchless)
+                long escapedQuotes = computeEscapedQuotes(backslashMask, prevBackslashOdd);
+                long toggles = quoteMask & ~escapedQuotes;
 
-            prevEndsWithBackslash =
-                extractBackslashCarry(backslashBits);
+                // Compute inside-string mask with parallel prefix XOR
+                long inStringMask = parallelPrefixXor(toggles) ^ (prevInString != 0 ? -1L : 0L);
 
-            int word = i >>> 6;
+                // Update carries for next vector
+                prevInString = extractLowBit(inStringMask, VLEN - 1);
+                prevBackslashOdd = computeBackslashCarry(backslashMask, VLEN - 1);
 
-            writeMasks(out, word,
-                quoteBits,
-                backslashBits,
-                controlBits,
-                structuralBits,
-                inStringMask
-            );
+                // Batched write to output
+                int word = pos >>> 6;
+                out.quoteMask[word] |= quoteMask;
+                out.backslashMask[word] |= backslashMask;
+                out.controlMask[word] |= controlMask;
+                out.structuralMask[word] |= structuralMask & ~inStringMask;
+                out.insideStringMask[word] |= inStringMask;
+            }
+
+            i = chunkEnd;
+        }
+
+        // Scalar fallback for remaining bytes
+        if (i < length) {
+            int processed = NaiveScalarScan.scan(
+                input, offset + i, length - i, out, prevInString, prevBackslashOdd);
+            i += processed;
+            prevInString = out.prevInString;
+            prevBackslashOdd = out.prevEndsWithBackslash;
         }
 
         out.prevInString = prevInString;
-        out.prevEndsWithBackslash = prevEndsWithBackslash;
+        out.prevEndsWithBackslash = prevBackslashOdd;
 
         return i;
     }
 
     /* ============================================================
-     * Vector loading
+     * Vector classification methods
      * ============================================================ */
 
-    /** Loads a SIMD vector from the input byte array. */
-    private static ByteVector loadVector(byte[] input, int index) {
-        return ByteVector.fromArray(SPECIES, input, index);
+    private static long detectQuotes(@NotNull ByteVector vec) {
+        return vec.eq(QUOTE).toLong();
     }
 
-    /* ============================================================
-     * Byte classification
-     * ============================================================ */
-
-    /** Detects {@code '"'} characters. */
-    private static long detectQuotes(@NotNull ByteVector v) {
-        return v.eq((byte) '"').toLong();
+    private static long detectBackslashes(@NotNull ByteVector vec) {
+        return vec.eq(BACKSLASH).toLong();
     }
 
-    /** Detects {@code '\\'} characters. */
-    private static long detectBackslashes(@NotNull ByteVector v) {
-        return v.eq((byte) '\\').toLong();
+    private static long detectControlChars(@NotNull ByteVector vec) {
+        return vec.compare(VectorOperators.LT, CONTROL_THRESHOLD).toLong();
     }
 
-    /** Detects ASCII control characters (byte &lt; 0x20). */
-    private static long detectControlCharacters(@NotNull ByteVector v) {
-        return v.compare(VectorOperators.LT, CONTROL_THRESHOLD).toLong();
-    }
-
-    /**
-     * Detects JSON structural characters:
-     * <pre>{ } [ ] , :</pre>
-     *
-     * <p>This mask still includes characters inside strings and must
-     * be suppressed later using the inside-string mask.
-     */
-    private static long detectStructuralCharacters(@NotNull ByteVector v) {
-        return v.eq((byte) '{')
-            .or(v.eq((byte) '}'))
-            .or(v.eq((byte) '['))
-            .or(v.eq((byte) ']'))
-            .or(v.eq((byte) ','))
-            .or(v.eq((byte) ':'))
+    private static long detectStructuralChars(@NotNull ByteVector vec) {
+        return vec.eq((byte) '{')
+            .or(vec.eq((byte) '}'))
+            .or(vec.eq((byte) '['))
+            .or(vec.eq((byte) ']'))
+            .or(vec.eq((byte) ','))
+            .or(vec.eq((byte) ':'))
             .toLong();
     }
 
     /* ============================================================
-     * String and escape handling
+     * Escape and string handling
      * ============================================================ */
 
-    /**
-     * Computes which bytes are escaped by a preceding backslash.
-     *
-     * <p>A byte is considered escaped if:
-     * <ul>
-     *   <li>it immediately follows a backslash</li>
-     *   <li>that backslash itself is not escaped</li>
-     * </ul>
-     *
-     * <p>{@code prevEndsWithBackslash} carries escape state across vector boundaries.
-     */
-    @Contract(pure = true)
-    private static long computeEscapedBytes(long backslashBits, long prevEndsWithBackslash) {
-        return ((backslashBits << 1) | prevEndsWithBackslash) & ~backslashBits;
+    /** Branchless propagation of escaped quotes using prefix XOR */
+    private static long computeEscapedQuotes(long backslashMask, long prevBackslashOdd) {
+        long bs = (backslashMask << 1) | prevBackslashOdd;
+        // Parallel prefix XOR to detect odd-numbered sequences
+        bs ^= bs << 1;
+        bs ^= bs << 2;
+        bs ^= bs << 4;
+        bs ^= bs << 8;
+        bs ^= bs << 16;
+        bs ^= bs << 32;
+        return bs & backslashMask; // only positions that actually escape quotes
     }
 
-    /**
-     * Computes the inside-string mask using prefix XOR.
-     *
-     * <p>The mask toggles state on every <em>unescaped</em> quote.
-     * The resulting bit is 1 for bytes inside a JSON string.
-     */
-    @Contract(pure = true)
-    private static long computeInsideStringMask(
-        long quoteBits,
-        long escapedBits,
-        long prevInString
-    ) {
-        long inString = quoteBits & ~escapedBits;
-        inString ^= inString << 1;
-        inString ^= inString << 2;
-        inString ^= inString << 4;
-        inString ^= inString << 8;
-        inString ^= inString << 16;
-        inString ^= inString << 32;
-
-        return inString ^ prevInString;
+    /** Parallel prefix XOR to compute inside-string state toggles */
+    private static long parallelPrefixXor(long toggles) {
+        long x = toggles;
+        x ^= x << 1;
+        x ^= x << 2;
+        x ^= x << 4;
+        x ^= x << 8;
+        x ^= x << 16;
+        x ^= x << 32;
+        return x;
     }
 
-    /**
-     * Extracts the carry bit indicating whether the scan ends inside a string.
-     */
-    private static long extractStringCarry(long inStringMask) {
-        return (inStringMask >>> 63) & 1L;
+    /** Extract a bit at a specific position */
+    private static long extractLowBit(long mask, int pos) {
+        return (mask >>> pos) & 1L;
     }
 
-    /**
-     * Extracts whether the vector ends with an unpaired backslash.
-     *
-     * <p>This is required to correctly escape the first byte of the next vector.
-     */
-    private static long extractBackslashCarry(long backslashBits) {
-        long lastBit = backslashBits >>> 63;
-        return ((Long.bitCount(backslashBits) & 1) != 0) ? lastBit : 0;
-    }
-
-    /* ============================================================
-     * Output
-     * ============================================================ */
-
-    /**
-     * Writes all computed masks into the ScanResult.
-     *
-     * <p>Structural characters inside strings are suppressed here.
-     */
-    private static void writeMasks(
-        @NotNull ScanResult out,
-        int word,
-        long quoteBits,
-        long backslashBits,
-        long controlBits,
-        long structuralBits,
-        long inStringMask
-    ) {
-        out.quoteMask[word]        = quoteBits;
-        out.backslashMask[word]    = backslashBits;
-        out.controlMask[word]      = controlBits;
-        out.insideStringMask[word] = inStringMask;
-        out.structuralMask[word]   = structuralBits & ~inStringMask;
+    /** Count trailing backslashes to compute carry into next vector */
+    private static long computeBackslashCarry(long backslashMask, int lastPos) {
+        long mask = backslashMask & ((1L << (lastPos + 1)) - 1);
+        if (mask == 0) return 0;
+        int lastSet = 63 - Long.numberOfLeadingZeros(mask);
+        int count = 0;
+        for (int i = lastSet; i >= 0; i--) {
+            if (((mask >>> i) & 1) != 0) count++;
+            else break;
+        }
+        return count & 1;
     }
 }
