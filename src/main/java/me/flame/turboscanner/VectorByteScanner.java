@@ -45,9 +45,9 @@ public final class VectorByteScanner implements ByteScanner {
         for (; i + lanes <= length; i += lanes) {
             ByteVector vector = loadVector(input, offset + i);
 
-            long quoteBits     = detectQuotes(vector);
-            long backslashBits = detectBackslashes(vector);
-            long controlBits   = detectControlCharacters(vector);
+            long quoteBits      = detectQuotes(vector);
+            long backslashBits  = detectBackslashes(vector);
+            long controlBits    = detectControlCharacters(vector);
             long structuralBits = detectStructuralCharacters(vector);
 
             long escapedBits =
