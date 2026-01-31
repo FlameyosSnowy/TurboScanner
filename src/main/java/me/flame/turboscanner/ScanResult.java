@@ -1,7 +1,5 @@
 package me.flame.turboscanner;
 
-import java.util.Arrays;
-
 /**
  * ScanResult stores the output of a single stage-1 byte scan over a JSON byte stream.
  *
@@ -45,6 +43,7 @@ import java.util.Arrays;
  * <h2>Thread safety</h2>
  * Not thread-safe. One ScanResult per scan or per thread.
  */
+@SuppressWarnings("unused")
 public final class ScanResult {
     final long[] quoteMask;
     final long[] backslashMask;
@@ -117,13 +116,20 @@ public final class ScanResult {
 
     @Override
     public int hashCode() {
-        int r = Arrays.hashCode(quoteMask);
-        r = 31 * r + Arrays.hashCode(backslashMask);
-        r = 31 * r + Arrays.hashCode(controlMask);
-        r = 31 * r + Arrays.hashCode(structuralMask);
-        r = 31 * r + Arrays.hashCode(insideStringMask);
-        r = 31 * r + lanes;
-        r = 31 * r + Boolean.hashCode(utf8Error);
-        return r;
+        int result = 1;
+
+        for (int i = 0; i < lanes; i++) {
+            long x = quoteMask[i] ^
+                        backslashMask[i] ^
+                        controlMask[i] ^
+                        structuralMask[i] ^
+                        insideStringMask[i];
+
+            result = 31 * result + Long.hashCode(x);
+        }
+
+        result = 31 * result + lanes;
+        result = 31 * result + (utf8Error ? 1 : 0);
+        return result;
     }
 }

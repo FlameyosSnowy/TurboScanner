@@ -31,6 +31,7 @@ package me.flame.turboscanner;
  * <h2>Safety</h2>
  * Implementations must not read outside {@code [offset, offset+length)}.
  */
+@SuppressWarnings("unused")
 public interface ByteScanner {
     /**
      * Scans a UTF-8 byte buffer and produces classification masks.
