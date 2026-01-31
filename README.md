@@ -12,5 +12,27 @@ TurboScanner centralizes the work of locating structural characters and validati
 
 This can be used to make high-performance parsers that scan, validate and decode multiple characters at once (Such as JSON parsers)
 
+# Examples
+Here is the low-level usage of TurboScanner:
+```java
+ScanResult result = new ScanResult(words);
+Utf8Validator utf8Validator = new ByteUtf8Validator();
+
+utf8Validator.validate(bytes, 0, length);
+if (utf8Validator.hasError()) {
+    // handle error
+}
+
+int length = scanner.scan(bytes, 0, length, result);
+if (length != words.length) {
+    // handle truncation error
+}
+
+utf8Validator.reset(); // if you will reuse the validator
+```
+
+Looks low-level? Good.
+Looks like something you'd see in C? Great.
+
 # License
 MIT License.
