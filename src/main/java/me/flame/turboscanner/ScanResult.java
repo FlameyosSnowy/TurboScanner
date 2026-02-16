@@ -147,4 +147,52 @@ public final class ScanResult {
         result = 31 * result + (utf8Error ? 1 : 0);
         return result;
     }
+
+    public long[] getQuoteMask() {
+        return quoteMask;
+    }
+
+    public long[] getBackslashMask() {
+        return backslashMask;
+    }
+
+    public long[] getControlMask() {
+        return controlMask;
+    }
+
+    public long[] getStructuralMask() {
+        return structuralMask;
+    }
+
+    public long[] getInsideStringMask() {
+        return insideStringMask;
+    }
+
+    public int getLanes() {
+        return lanes;
+    }
+
+    public long getPrevInString() {
+        return prevInString;
+    }
+
+    public void setPrevInString(long prevInString) {
+        this.prevInString = prevInString;
+    }
+
+    public long getPrevEndsWithBackslash() {
+        return prevEndsWithBackslash;
+    }
+
+    public void setPrevEndsWithBackslash(long prevEndsWithBackslash) {
+        this.prevEndsWithBackslash = prevEndsWithBackslash;
+    }
+
+    public boolean isUtf8Error() {
+        return utf8Error;
+    }
+
+    public void setUtf8Error(boolean utf8Error) {
+        this.utf8Error = utf8Error;
+    }
 }
