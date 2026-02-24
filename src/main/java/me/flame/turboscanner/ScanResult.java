@@ -88,7 +88,8 @@ public final class ScanResult {
     }
 
     public void clear() {
-        for (int i = 0; i < lanes; i++) {
+        int words = lanes + 1;   // match constructor allocation
+        for (int i = 0; i < words; i++) {
             quoteMask[i] = 0L;
             backslashMask[i] = 0L;
             controlMask[i] = 0L;
@@ -98,6 +99,97 @@ public final class ScanResult {
         prevInString = 0L;
         prevEndsWithBackslash = 0L;
         utf8Error = false;
+    }
+
+    // ── Batch iteration helpers ───────────────────────────────────────────────
+
+    /**
+     * Returns the raw 64-bit word of the inside-string mask for the word
+     * containing {@code byteIndex}. The caller can then drain bits with
+     * {@link Long#numberOfTrailingZeros} + clear-lowest-bit.
+     *
+     * <pre>
+     * long word = r.insideStringWord(baseIndex);
+     * while (word != 0) {
+     *     int bit = Long.numberOfTrailingZeros(word);
+     *     int bytePos = baseIndex + bit;
+     *     // ... process bytePos ...
+     *     word &= word - 1;  // clear lowest set bit
+     * }
+     * </pre>
+     */
+    public long insideStringWord(int byteIndex) {
+        return insideStringMask[byteIndex >>> 6];
+    }
+
+    public long structuralWord(int byteIndex) {
+        return structuralMask[byteIndex >>> 6];
+    }
+
+    public long quoteWord(int byteIndex) {
+        return quoteMask[byteIndex >>> 6];
+    }
+
+    public long backslashWord(int byteIndex) {
+        return backslashMask[byteIndex >>> 6];
+    }
+
+    public long controlWord(int byteIndex) {
+        return controlMask[byteIndex >>> 6];
+    }
+
+    /**
+     * Iterate all set bits across the entire mask, invoking {@code consumer}
+     * with each byte position. Zero allocation; inner loop is a standard
+     * bit-drain pattern the JIT reduces to BSF/BLSR on x86.
+     */
+    public void forEachStructural(java.util.function.IntConsumer consumer) {
+        forEachSet(structuralMask, consumer);
+    }
+
+    public void forEachInsideString(java.util.function.IntConsumer consumer) {
+        forEachSet(insideStringMask, consumer);
+    }
+
+    public void forEachQuote(java.util.function.IntConsumer consumer) {
+        forEachSet(quoteMask, consumer);
+    }
+
+    private void forEachSet(long[] mask, java.util.function.IntConsumer consumer) {
+        for (int w = 0; w < lanes; w++) {
+            long word = mask[w];
+            int base  = w << 6;
+            while (word != 0) {
+                consumer.accept(base + Long.numberOfTrailingZeros(word));
+                word &= word - 1;
+            }
+        }
+    }
+
+    /**
+     * Returns the next set bit at or after {@code fromByteIndex}, or -1 if none.
+     * Useful for parsers that want to skip ahead to the next structural character.
+     */
+    public int nextStructural(int fromByteIndex) {
+        return nextSet(structuralMask, fromByteIndex);
+    }
+
+    public int nextQuote(int fromByteIndex) {
+        return nextSet(quoteMask, fromByteIndex);
+    }
+
+    private int nextSet(long[] mask, int from) {
+        int  word = from >>> 6;
+        int  bit  = from & 63;
+        if (word >= lanes) return -1;
+
+        // Mask off bits before `from` in the first word
+        long w = mask[word] & (-1L << bit);
+        while (true) {
+            if (w != 0) return (word << 6) + Long.numberOfTrailingZeros(w);
+            if (++word >= lanes) return -1;
+            w = mask[word];
+        }
     }
 
     /* -------------------- Query helpers -------------------- */
