@@ -11,7 +11,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class VectorByteScannerMaskTest {
 
-    private final VectorByteScanner simd   = new VectorByteScanner();
+    private final ByteScanner simd   = new VectorByteScanner();
 
     private ScanResult scan(String json) {
         byte[] b = json.getBytes(StandardCharsets.UTF_8);
@@ -189,10 +189,8 @@ class VectorByteScannerMaskTest {
     @Test
     void masksCorrect_stringSpansVectorBoundary() {
         // Put an opening quote just before byte 32 so the string body crosses the vector boundary
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < 30; i++) sb.append('a'); // 30 non-string bytes
-        sb.append("\"crossboundarystring\"");
-        String json = sb.toString();
+        String json = "a".repeat(30) + // 30 non-string bytes
+            "\"crossboundarystring\"";
         byte[] b = json.getBytes(StandardCharsets.UTF_8);
         ScanResult r = ScanResult.create(b.length);
         simd.scan(b, 0, b.length, r);
