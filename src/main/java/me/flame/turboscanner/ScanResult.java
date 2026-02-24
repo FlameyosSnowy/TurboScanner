@@ -2,6 +2,8 @@ package me.flame.turboscanner;
 
 import org.jetbrains.annotations.Contract;
 
+import java.util.Arrays;
+
 /**
  * ScanResult stores the output of a single stage-1 byte scan over a JSON byte stream.
  *
@@ -63,11 +65,13 @@ public final class ScanResult {
 
     private ScanResult(int lanes) {
         this.lanes = lanes;
-        this.quoteMask = new long[lanes];
-        this.backslashMask = new long[lanes];
-        this.controlMask = new long[lanes];
-        this.structuralMask = new long[lanes];
-        this.insideStringMask = new long[lanes];
+
+        int words = lanes + 1;
+        this.quoteMask = new long[words];
+        this.backslashMask = new long[words];
+        this.controlMask = new long[words];
+        this.structuralMask = new long[words];
+        this.insideStringMask = new long[words];
     }
 
     public static ScanResult create(int byteLength) {
@@ -80,7 +84,7 @@ public final class ScanResult {
 
     @Contract(pure = true)
     public static int lanesFor(int byteLength) {
-        return (byteLength + 63) >>> 6;
+        return (byteLength + 63 + (VectorByteScanner.VLEN - 1)) >>> 6;
     }
 
     public void clear() {
@@ -134,13 +138,11 @@ public final class ScanResult {
         int result = 1;
 
         for (int i = 0; i < lanes; i++) {
-            long x = quoteMask[i] ^
-                        backslashMask[i] ^
-                        controlMask[i] ^
-                        structuralMask[i] ^
-                        insideStringMask[i];
-
-            result = 31 * result + Long.hashCode(x);
+            result = 31 * result + Long.hashCode(quoteMask[i]);
+            result = 31 * result + Long.hashCode(backslashMask[i]);
+            result = 31 * result + Long.hashCode(controlMask[i]);
+            result = 31 * result + Long.hashCode(insideStringMask[i]);
+            result = 31 * result + Long.hashCode(structuralMask[i]);
         }
 
         result = 31 * result + lanes;
@@ -194,5 +196,20 @@ public final class ScanResult {
 
     public void setUtf8Error(boolean utf8Error) {
         this.utf8Error = utf8Error;
+    }
+
+    @Override
+    public String toString() {
+        return "ScanResult{" +
+            "quoteMask=" + Arrays.toString(quoteMask) +
+            ", backslashMask=" + Arrays.toString(backslashMask) +
+            ", controlMask=" + Arrays.toString(controlMask) +
+            ", structuralMask=" + Arrays.toString(structuralMask) +
+            ", insideStringMask=" + Arrays.toString(insideStringMask) +
+            ", lanes=" + lanes +
+            ", prevInString=" + prevInString +
+            ", prevEndsWithBackslash=" + prevEndsWithBackslash +
+            ", utf8Error=" + utf8Error +
+            '}';
     }
 }
