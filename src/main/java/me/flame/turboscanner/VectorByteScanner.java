@@ -5,134 +5,153 @@ import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 import org.jetbrains.annotations.NotNull;
 
-/**
- * High-performance stage-1 JSON byte scanner using SIMD.
- *
- * <p>This scanner:
- * <ul>
- *   <li>Classifies quotes, backslashes, control chars, and structural chars</li>
- *   <li>Computes inside-string mask with branchless prefix XOR</li>
- *   <li>Uses cache-line aligned chunking to reduce memory latency</li>
- *   <li>Falls back to scalar processing for remaining bytes</li>
- * </ul>
- */
 public final class VectorByteScanner implements ByteScanner {
 
     private static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
-    private static final int VLEN = SPECIES.length();
-    private static final int CHUNK_SIZE = 512; // process 8 cache lines at a time
+    public static final int VLEN = SPECIES.length();
+    private static final int CHUNK_SIZE = 512;
     private static final byte CONTROL_THRESHOLD = 0x20;
-    private static final byte QUOTE = (byte) '"';
+    private static final byte QUOTE    = (byte) '"';
     private static final byte BACKSLASH = (byte) '\\';
+
+    // Precomputed per-lane-count masks: LANE_MASKS[n] = (1L << n) - 1, n in [0..63], [64] = -1L
+    private static final long[] LANE_MASKS = buildLaneMasks();
+
+    private static long[] buildLaneMasks() {
+        long[] m = new long[65];
+        for (int i = 0; i < 64; i++) m[i] = (1L << i) - 1L;
+        m[64] = -1L;
+        return m;
+    }
 
     @Override
     public int scan(byte[] input, int offset, int length, @NotNull ScanResult out) {
         if (length == 0) return 0;
 
-        long prevInString = out.prevInString;
+        // Carries stay in registers for the entire scan — no store/load per vector
+        long prevInString     = out.prevInString;
         long prevBackslashOdd = out.prevEndsWithBackslash;
-        int i = 0;
 
         final int simdLimit = length - (length % VLEN);
+        final int tail      = length - simdLimit;
 
-        // Process input in chunks to improve cache locality
+        // ── hot loop: full vectors ────────────────────────────────────────────
+        int i = 0;
         while (i < simdLimit) {
-            int chunkLen = Math.min(simdLimit - i, CHUNK_SIZE);
-            int chunkEnd = i + chunkLen;
+            final int chunkEnd = Math.min(simdLimit, i + CHUNK_SIZE);
+            while (i < chunkEnd) {
+                final ByteVector vec = ByteVector.fromArray(SPECIES, input, offset + i);
+                final long vlenMask  = LANE_MASKS[VLEN]; // -1L for VLEN=64, else correct mask
 
-            for (int pos = i; pos < chunkEnd; pos += VLEN) {
-                ByteVector vec = ByteVector.fromArray(SPECIES, input, offset + pos);
+                long qMask = vec.eq(QUOTE).toLong();
+                long bsMask = vec.eq(BACKSLASH).toLong();
+                long ctrlMask = vec.compare(VectorOperators.LT, CONTROL_THRESHOLD).toLong();
+                long strMask = vec.eq((byte)'{').or(vec.eq((byte)'}'))
+                    .or(vec.eq((byte)'[')).or(vec.eq((byte)']'))
+                    .or(vec.eq((byte)',')).or(vec.eq((byte)':')).toLong();
 
-                // Extract masks for quote, backslash, control, structural chars
-                long quoteMask = detectQuotes(vec);
-                long backslashMask = detectBackslashes(vec);
-                long controlMask = detectControlChars(vec);
-                long structuralMask = detectStructuralChars(vec);
+                long escaped   = computeEscapedPositions(bsMask, prevBackslashOdd);
+                long toggles   = qMask & ~escaped;
+                long inStrAfter = parallelPrefixXor(toggles)
+                    ^ (prevInString != 0 ? -1L : 0L);
+                inStrAfter     &= vlenMask;           // clamp — no branch, precomputed
+                long inStrMask  = inStrAfter & ~toggles;
 
-                // Compute escaped quotes (branchless)
-                long escapedQuotes = computeEscapedQuotes(backslashMask, prevBackslashOdd);
-                long toggles = quoteMask & ~escapedQuotes;
+                // carries stay local — no memory round-trip
+                prevInString     = (inStrAfter >>> (VLEN - 1)) & 1L;
+                prevBackslashOdd = computeBackslashCarry(bsMask, VLEN - 1);
 
-                // Compute inside-string mask with parallel prefix XOR
-                long inStringMask = parallelPrefixXor(toggles) ^ (prevInString != 0 ? -1L : 0L);
+                // VLEN always divides evenly into 64-bit words when VLEN <= 64,
+                // and pos is always a multiple of VLEN, so shift is always 0
+                // when VLEN == 64, OR pos/VLEN lands on a word boundary when VLEN == 32.
+                // writeMasked needed only for VLEN < 64.
+                final int word  = i >>> 6;
+                final int shift = i & 63;
+                out.quoteMask[word]        |= (toggles          << shift);
+                out.backslashMask[word]    |= (bsMask           << shift);
+                out.controlMask[word]      |= (ctrlMask         << shift);
+                out.structuralMask[word]   |= ((strMask & ~inStrMask) << shift);
+                out.insideStringMask[word] |= (inStrMask        << shift);
+                // spill upper bits if vector straddles a word boundary
+                if (shift != 0) {
+                    final int rshift = 64 - shift;
+                    out.quoteMask[word+1]        |= (toggles          >>> rshift);
+                    out.backslashMask[word+1]    |= (bsMask           >>> rshift);
+                    out.controlMask[word+1]      |= (ctrlMask         >>> rshift);
+                    out.structuralMask[word+1]   |= ((strMask & ~inStrMask) >>> rshift);
+                    out.insideStringMask[word+1] |= (inStrMask        >>> rshift);
+                }
 
-                // Update carries for next vector
-                prevInString = extractLowBit(inStringMask, VLEN - 1);
-                prevBackslashOdd = computeBackslashCarry(backslashMask, VLEN - 1);
-
-                // Batched write to output
-                int word = pos >>> 6;
-                out.quoteMask[word] |= quoteMask;
-                out.backslashMask[word] |= backslashMask;
-                out.controlMask[word] |= controlMask;
-                out.structuralMask[word] |= structuralMask & ~inStringMask;
-                out.insideStringMask[word] |= inStringMask;
+                i += VLEN;
             }
-
-            i = chunkEnd;
         }
 
-        // Scalar fallback for remaining bytes
-        if (i < length) {
-            int processed = NaiveScalarScan.scan(
-                input, offset + i, length - i, out, prevInString, prevBackslashOdd);
-            i += processed;
-            prevInString = out.prevInString;
-            prevBackslashOdd = out.prevEndsWithBackslash;
+        // ── tail: single masked vector, same logic, no branch on shift=0 ─────
+        if (tail > 0) {
+            final ByteVector vec = ByteVector.fromArray(
+                SPECIES, input, offset + i, SPECIES.indexInRange(0, tail));
+            final long laneMask = LANE_MASKS[tail]; // exact tail mask, no branch
+
+            long qMask    = vec.eq(QUOTE).toLong()                          & laneMask;
+            long bsMask   = vec.eq(BACKSLASH).toLong()                      & laneMask;
+            long ctrlMask = vec.compare(VectorOperators.LT, CONTROL_THRESHOLD).toLong() & laneMask;
+            long strMask  = vec.eq((byte)'{').or(vec.eq((byte)'}'))
+                .or(vec.eq((byte)'[')).or(vec.eq((byte)']'))
+                .or(vec.eq((byte)',')).or(vec.eq((byte)':')).toLong() & laneMask;
+
+            long escaped    = computeEscapedPositions(bsMask, prevBackslashOdd);
+            long toggles    = qMask & ~escaped;
+            long inStrAfter = (parallelPrefixXor(toggles) ^ (prevInString != 0 ? -1L : 0L))
+                & laneMask;                 // clamp to tail, no branch
+            long inStrMask  = inStrAfter & ~toggles;
+
+            prevInString     = (inStrAfter >>> (tail - 1)) & 1L;
+            prevBackslashOdd = computeBackslashCarry(bsMask, tail - 1);
+
+            final int word  = i >>> 6;
+            final int shift = i & 63;
+            out.quoteMask[word]        |= (toggles               << shift);
+            out.backslashMask[word]    |= (bsMask                << shift);
+            out.controlMask[word]      |= (ctrlMask              << shift);
+            out.structuralMask[word]   |= ((strMask & ~inStrMask)<< shift);
+            out.insideStringMask[word] |= (inStrMask             << shift);
+            if (shift != 0) {
+                final int rshift = 64 - shift;
+                out.quoteMask[word+1]        |= (toggles               >>> rshift);
+                out.backslashMask[word+1]    |= (bsMask                >>> rshift);
+                out.controlMask[word+1]      |= (ctrlMask              >>> rshift);
+                out.structuralMask[word+1]   |= ((strMask & ~inStrMask)>>> rshift);
+                out.insideStringMask[word+1] |= (inStrMask             >>> rshift);
+            }
         }
 
-        out.prevInString = prevInString;
+        out.prevInString          = prevInString;
         out.prevEndsWithBackslash = prevBackslashOdd;
-
-        return i;
+        return length;
     }
 
-    /* ============================================================
-     * Vector classification methods
-     * ============================================================ */
+    // ── escape handling ───────────────────────────────────────────────────────
 
-    private static long detectQuotes(@NotNull ByteVector vec) {
-        return vec.eq(QUOTE).toLong();
+    private static long computeEscapedPositions(long bsMask, long prevCarry) {
+        if (bsMask == 0 && prevCarry == 0) return 0L;
+        long px      = parallelPrefixXor(bsMask) ^ (prevCarry != 0 ? -1L : 0L);
+        long escapers = px & bsMask;
+        long pos0     = prevCarry & ~bsMask & 1L;
+        return (escapers << 1) | pos0;
     }
 
-    private static long detectBackslashes(@NotNull ByteVector vec) {
-        return vec.eq(BACKSLASH).toLong();
+    private static long computeBackslashCarry(long bsMask, int lastPos) {
+        long mask = bsMask & LANE_MASKS[lastPos + 1 > 63 ? 64 : lastPos + 1];
+        if (mask == 0L) return 0L;
+        int top = 63 - Long.numberOfLeadingZeros(mask);
+        int cnt = 0;
+        for (int k = top; k >= 0 && ((mask >>> k) & 1L) != 0; k--) cnt++;
+        return cnt & 1L;
     }
 
-    private static long detectControlChars(@NotNull ByteVector vec) {
-        return vec.compare(VectorOperators.LT, CONTROL_THRESHOLD).toLong();
-    }
+    // ── bitwise helpers ───────────────────────────────────────────────────────
 
-    private static long detectStructuralChars(@NotNull ByteVector vec) {
-        return vec.eq((byte) '{')
-            .or(vec.eq((byte) '}'))
-            .or(vec.eq((byte) '['))
-            .or(vec.eq((byte) ']'))
-            .or(vec.eq((byte) ','))
-            .or(vec.eq((byte) ':'))
-            .toLong();
-    }
-
-    /* ============================================================
-     * Escape and string handling
-     * ============================================================ */
-
-    /** Branchless propagation of escaped quotes using prefix XOR */
-    private static long computeEscapedQuotes(long backslashMask, long prevBackslashOdd) {
-        long bs = (backslashMask << 1) | prevBackslashOdd;
-        // Parallel prefix XOR to detect odd-numbered sequences
-        bs ^= bs << 1;
-        bs ^= bs << 2;
-        bs ^= bs << 4;
-        bs ^= bs << 8;
-        bs ^= bs << 16;
-        bs ^= bs << 32;
-        return bs & backslashMask; // only positions that actually escape quotes
-    }
-
-    /** Parallel prefix XOR to compute inside-string state toggles */
-    private static long parallelPrefixXor(long toggles) {
-        long x = toggles;
+    private static long parallelPrefixXor(long x) {
         x ^= x << 1;
         x ^= x << 2;
         x ^= x << 4;
@@ -140,23 +159,5 @@ public final class VectorByteScanner implements ByteScanner {
         x ^= x << 16;
         x ^= x << 32;
         return x;
-    }
-
-    /** Extract a bit at a specific position */
-    private static long extractLowBit(long mask, int pos) {
-        return (mask >>> pos) & 1L;
-    }
-
-    /** Count trailing backslashes to compute carry into next vector */
-    private static long computeBackslashCarry(long backslashMask, int lastPos) {
-        long mask = backslashMask & ((1L << (lastPos + 1)) - 1);
-        if (mask == 0) return 0;
-        int lastSet = 63 - Long.numberOfLeadingZeros(mask);
-        int count = 0;
-        for (int i = lastSet; i >= 0; i--) {
-            if (((mask >>> i) & 1) != 0) count++;
-            else break;
-        }
-        return count & 1;
     }
 }
