@@ -14,13 +14,56 @@ public final class VectorByteScanner implements ByteScanner {
     private static final byte QUOTE    = (byte) '"';
     private static final byte BACKSLASH = (byte) '\\';
 
-    // Precomputed per-lane-count masks: LANE_MASKS[n] = (1L << n) - 1, n in [0..63], [64] = -1L
+    // Precomputed per-lane-count masks.
+    // LANE_MASKS[n] will contain a long value where the lowest `n` bits are set to 1.
+    // Example:
+    //   LANE_MASKS[0]  = 0b0
+    //   LANE_MASKS[1]  = 0b1
+    //   LANE_MASKS[2]  = 0b11
+    //   LANE_MASKS[3]  = 0b111
+    //   ...
+    //   LANE_MASKS[64] = 0xFFFF_FFFF_FFFF_FFFFL (all 64 bits set)
+    //
+    // This avoids recomputing (1L << n) - 1 at runtime.
     private static final long[] LANE_MASKS = buildLaneMasks();
 
     private static long[] buildLaneMasks() {
+        // Allocate array of size 65 to support masks for 0..64 bits inclusive.
         long[] m = new long[65];
-        for (int i = 0; i < 64; i++) m[i] = (1L << i) - 1L;
+
+        // For n in [0..63]:
+        // (1L << n) creates a long with a single 1-bit at position n.
+        // Subtracting 1 turns all lower bits into 1.
+        //
+        // Example:
+        // n = 5
+        // 1L << 5  = 0b100000  (32)
+        // minus 1  = 0b011111  (31)
+        //
+        // So m[n] becomes a mask with the lowest n bits set.
+        for (int i = 0; i < 64; i++) {
+            m[i] = (1L << i) - 1L;
+        }
+
+        // Special case for 64:
+        //
+        // In Java, shifting a long by 64 does NOT work as expected.
+        // Shift distance is masked with & 63, so:
+        //
+        // 1L << 64  == 1L << (64 % 64)
+        //            == 1L << 0
+        //            == 1
+        //
+        // That would break the formula.
+        //
+        // Instead, we manually assign -1L, which in two's complement
+        // is represented as all 64 bits set to 1:
+        //
+        // 0xFFFF_FFFF_FFFF_FFFFL
+        //
+        // That is the correct 64-bit full mask.
         m[64] = -1L;
+
         return m;
     }
 
@@ -28,14 +71,12 @@ public final class VectorByteScanner implements ByteScanner {
     public int scan(byte[] input, int offset, int length, @NotNull ScanResult out) {
         if (length == 0) return 0;
 
-        // Carries stay in registers for the entire scan — no store/load per vector
         long prevInString     = out.prevInString;
         long prevBackslashOdd = out.prevEndsWithBackslash;
 
         final int simdLimit = length - (length % VLEN);
         final int tail      = length - simdLimit;
 
-        // ── hot loop: full vectors ────────────────────────────────────────────
         int i = 0;
         while (i < simdLimit) {
             final int chunkEnd = Math.min(simdLimit, i + CHUNK_SIZE);
@@ -54,10 +95,9 @@ public final class VectorByteScanner implements ByteScanner {
                 long toggles   = qMask & ~escaped;
                 long inStrAfter = parallelPrefixXor(toggles)
                     ^ (prevInString != 0 ? -1L : 0L);
-                inStrAfter     &= vlenMask;           // clamp — no branch, precomputed
+                inStrAfter     &= vlenMask;
                 long inStrMask  = inStrAfter & ~toggles;
 
-                // carries stay local — no memory round-trip
                 prevInString     = (inStrAfter >>> (VLEN - 1)) & 1L;
                 prevBackslashOdd = computeBackslashCarry(bsMask, VLEN - 1);
 
@@ -86,7 +126,6 @@ public final class VectorByteScanner implements ByteScanner {
             }
         }
 
-        // ── tail: single masked vector, same logic, no branch on shift=0 ─────
         if (tail > 0) {
             final ByteVector vec = ByteVector.fromArray(
                 SPECIES, input, offset + i, SPECIES.indexInRange(0, tail));
@@ -130,8 +169,6 @@ public final class VectorByteScanner implements ByteScanner {
         return length;
     }
 
-    // ── escape handling ───────────────────────────────────────────────────────
-
     private static long computeEscapedPositions(long bsMask, long prevCarry) {
         if (bsMask == 0 && prevCarry == 0) return 0L;
         long px      = parallelPrefixXor(bsMask) ^ (prevCarry != 0 ? -1L : 0L);
@@ -148,8 +185,6 @@ public final class VectorByteScanner implements ByteScanner {
         for (int k = top; k >= 0 && ((mask >>> k) & 1L) != 0; k--) cnt++;
         return cnt & 1L;
     }
-
-    // ── bitwise helpers ───────────────────────────────────────────────────────
 
     private static long parallelPrefixXor(long x) {
         x ^= x << 1;
