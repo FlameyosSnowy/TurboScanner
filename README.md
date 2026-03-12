@@ -10,7 +10,7 @@ TurboScanner centralizes the work of locating structural characters and validati
 - One loop and branchless equals/hashCode on ScanResult for all five mask arrays
 - In-string masking.
 
-This can be used to make high-performance parsers that scan, validate and decode multiple characters at once (Such as JSON parsers)
+This can be used to make high-performance parsers that scan, validate and decode multiple characters at once (Such as JSON parsers), used by [Uniform, my own JSON library](https://github.com/FlameyosSnowy/Uniform)
 
 # Examples
 Here is the low-level usage of TurboScanner:
