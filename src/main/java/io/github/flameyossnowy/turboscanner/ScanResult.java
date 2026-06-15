@@ -101,8 +101,6 @@ public final class ScanResult {
         utf8Error = false;
     }
 
-    // ── Batch iteration helpers ───────────────────────────────────────────────
-
     /**
      * Returns the raw 64-bit word of the inside-string mask for the word
      * containing {@code byteIndex}. The caller can then drain bits with
@@ -191,8 +189,6 @@ public final class ScanResult {
             w = mask[word];
         }
     }
-
-    /* -------------------- Query helpers -------------------- */
 
     public boolean isInsideString(int index) {
         return ((insideStringMask[index >>> 6] >>> (index & 63)) & 1L) != 0;

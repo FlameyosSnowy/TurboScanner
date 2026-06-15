@@ -273,7 +273,7 @@ class VectorByteScannerMaskTest {
         for (int i = 0; i < 30; i++) b[i] = 'a';
         b[30] = '"';
         b[31] = '\\';
-        b[32] = '"'; // escaped quote — must NOT close string
+        b[32] = '"';
         b[33] = '"'; // real closing quote
         ScanResult r = ScanResult.create(b.length);
         simd.scan(b, 0, b.length, r);

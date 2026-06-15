@@ -2,9 +2,6 @@ package io.github.flameyossnowy.turboscanner;
 
 @SuppressWarnings("unused")
 public final class ScanWindow {
-    // Must be a multiple of 64 (one bitmask word = 64 bytes).
-    // 4096 bytes = 64 words. Large enough to amortize scan cost,
-    // small enough to fit in L1 on most CPUs (32–48 KB L1D).
     public static final int CHUNK_SIZE = 4096;
 
     // Refill when fewer than this many bytes remain in the window.
@@ -18,11 +15,8 @@ public final class ScanWindow {
     private final int              inputLen;
     private final VectorByteScanner scanner;
 
-    // The ScanResult is reused — clear() + re-scan per chunk.
-    // Allocated once with WORDS+1 words (extra word for spill).
     private final ScanResult result;
 
-    // Absolute byte offset of the first byte covered by result.
     private int windowBase;
 
     // How many bytes are valid in the current window
@@ -68,8 +62,6 @@ public final class ScanWindow {
         windowBase = newBase;
         windowLen  = newLen;
     }
-
-    // ── Bitmask accessors — all take ABSOLUTE byte positions ─────────────────
 
     /** Convert absolute position to word index within the current window. */
     private int word(int absPos) {
